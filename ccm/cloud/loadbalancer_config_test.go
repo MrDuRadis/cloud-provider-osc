@@ -6,6 +6,7 @@ SPDX-License-Identifier: BSD-3-Clause
 package cloud_test
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/outscale/cloud-provider-osc/ccm/cloud"
@@ -14,12 +15,205 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/utils/net"
 )
 
 func ipNetSet(nets ...string) utilnet.IPNetSet {
 	set, _ := utilnet.ParseIPNets(nets...)
 	return set
+}
+
+func TestLoadBalancerNamesFromService(t *testing.T) {
+	tests := []struct {
+		name        string
+		uid         string
+		annotations map[string]string
+		want        []string
+		wantErr     bool
+	}{
+		{
+			name: "UID name",
+			uid:  "01234567-89ab-cdef-0123-456789abcdef",
+			want: []string{"0123456789abcdef0123456789abcdef"},
+		},
+		{
+			name: "OSC annotated multi-instance names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name":      "name-a,name-b",
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			want: []string{"name-a", "name-b"},
+		},
+		{
+			name: "AWS annotation aliases",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/aws-load-balancer-name":      "name-a,name-b",
+				"service.beta.kubernetes.io/aws-load-balancer-instances": "2",
+			},
+			want: []string{"name-a", "name-b"},
+		},
+		{
+			name: "generated multi-instance names are truncated",
+			uid:  "5dbb147b-3878-4d10-bf2d-96b2b463b8eb",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			want: []string{"5dbb147b38784d10bf2d96b2b463b8-a", "5dbb147b38784d10bf2d96b2b463b8-b"},
+		},
+		{
+			name: "unrelated invalid annotation is ignored",
+			uid:  "012-345",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-healthcheck-port": "invalid",
+			},
+			want: []string{"012345"},
+		},
+		{
+			name: "too few configured names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name":      "name-a",
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			wantErr: true,
+		},
+		{
+			name: "too many OSC configured names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name":      "name-a,name-b",
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "too many AWS configured names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/aws-load-balancer-name":      "name-a,name-b",
+				"service.beta.kubernetes.io/aws-load-balancer-instances": "1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "instances above supported range",
+			uid:  "012-345",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "4",
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative instances",
+			uid:  "012-345",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "-1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "huge instances",
+			uid:  "012-345",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "999999999999999999",
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty UID for generated multi-instance names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			wantErr: true,
+		},
+		{
+			name: "conflicting OSC and AWS names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name": "name-a",
+				"service.beta.kubernetes.io/aws-load-balancer-name": "name-b",
+			},
+			wantErr: true,
+		},
+		{
+			name: "conflicting OSC and AWS instance counts",
+			uid:  "012-345",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "1",
+				"service.beta.kubernetes.io/aws-load-balancer-instances": "2",
+			},
+			wantErr: true,
+		},
+		{
+			name: "duplicate configured names",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name":      "name-a,name-a",
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			wantErr: true,
+		},
+		{
+			name: "duplicate names after truncation",
+			annotations: map[string]string{
+				"service.beta.kubernetes.io/osc-load-balancer-name":      "nametotallyandabsolutelytoolong-foo,nametotallyandabsolutelytoolong-bar",
+				"service.beta.kubernetes.io/osc-load-balancer-instances": "2",
+			},
+			wantErr: true,
+		},
+		{
+			name:    "empty identity",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{UID: types.UID(tt.uid), Annotations: maps.Clone(tt.annotations)}}
+			original := svc.DeepCopy()
+
+			got, err := cloud.LoadBalancerNamesFromService(svc)
+
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+			assert.Equal(t, original, svc)
+		})
+	}
+}
+
+func TestNewLoadBalancerUsesTheSameIdentityValidation(t *testing.T) {
+	tests := []map[string]string{
+		{
+			"service.beta.kubernetes.io/osc-load-balancer-name": "name-a",
+			"service.beta.kubernetes.io/aws-load-balancer-name": "name-b",
+		},
+		{
+			"service.beta.kubernetes.io/osc-load-balancer-instances": "1",
+			"service.beta.kubernetes.io/aws-load-balancer-instances": "2",
+		},
+		{
+			"service.beta.kubernetes.io/osc-load-balancer-name":      "name-a,name-b",
+			"service.beta.kubernetes.io/osc-load-balancer-instances": "1",
+		},
+		{
+			"service.beta.kubernetes.io/aws-load-balancer-name":      "name-a,name-b",
+			"service.beta.kubernetes.io/aws-load-balancer-instances": "1",
+		},
+	}
+
+	for _, annotations := range tests {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{UID: "012-345", Annotations: annotations},
+			Spec: corev1.ServiceSpec{
+				SessionAffinity: corev1.ServiceAffinityNone,
+				Ports:           []corev1.ServicePort{{Protocol: corev1.ProtocolTCP}},
+			},
+		}
+		_, namesErr := cloud.LoadBalancerNamesFromService(svc)
+		_, buildErr := cloud.NewLoadBalancer(svc, nil)
+		require.Error(t, namesErr)
+		require.Error(t, buildErr)
+	}
 }
 
 func TestNewLoadBalancer(t *testing.T) {
@@ -598,6 +792,7 @@ func TestNewLoadBalancer(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
+			original := tc.svc.DeepCopy()
 			tags := tc.tags
 			if tags == nil {
 				tags = map[string]string{}
@@ -609,6 +804,7 @@ func TestNewLoadBalancer(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, tc.lb, lb)
 			}
+			assert.Equal(t, original, tc.svc)
 		})
 	}
 }

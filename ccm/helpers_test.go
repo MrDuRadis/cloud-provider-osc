@@ -104,10 +104,14 @@ var (
 )
 
 func expectNoLoadbalancer(mock *mocks_osc.MockClient) {
+	expectNoLoadbalancersByNames(mock, []string{lbName})
+}
+
+func expectNoLoadbalancersByNames(mock *mocks_osc.MockClient, names []string) {
 	mock.EXPECT().
 		ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
 			Filters: &osc.FiltersLoadBalancer{
-				LoadBalancerNames: &[]string{lbName},
+				LoadBalancerNames: &names,
 			},
 		})).
 		Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &[]osc.LoadBalancer{}}, nil)

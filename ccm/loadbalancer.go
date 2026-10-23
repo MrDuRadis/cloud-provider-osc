@@ -18,6 +18,17 @@ import (
 
 // GetLoadBalancer implements cloudprovider.LoadBalancer
 func (c *Provider) GetLoadBalancer(ctx context.Context, clusterName string, svc *v1.Service) (*v1.LoadBalancerStatus, bool, error) {
+	names, err := cloud.LoadBalancerNamesFromService(svc)
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to derive LB names: %w", err)
+	}
+	exists, err := c.cloud.LoadBalancerExistsByNames(ctx, names)
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to check LB: %w", err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
 	lb, err := cloud.NewLoadBalancer(svc, c.opts.LBTags)
 	if err != nil {
 		return nil, false, fmt.Errorf("unable to build LB: %w", err)
@@ -35,11 +46,11 @@ func (c *Provider) GetLoadBalancer(ctx context.Context, clusterName string, svc 
 
 // GetLoadBalancerName implements cloudprovider.LoadBalancer
 func (c *Provider) GetLoadBalancerName(ctx context.Context, clusterName string, svc *v1.Service) string {
-	lb, err := cloud.NewLoadBalancer(svc, c.opts.LBTags)
-	if err != nil || len(lb.Name) == 0 {
+	names, err := cloud.LoadBalancerNamesFromService(svc)
+	if err != nil || len(names) == 0 {
 		return ""
 	}
-	return lb.Name[0]
+	return names[0]
 }
 
 func (c *Provider) resolveLBUHostname(ctx context.Context, hostname string) (string, error) {
@@ -132,11 +143,22 @@ func (c *Provider) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 
 // EnsureLoadBalancerDeleted implements cloudprovider.LoadBalancer.
 func (c *Provider) EnsureLoadBalancerDeleted(ctx context.Context, clusterName string, svc *v1.Service) error {
+	names, err := cloud.LoadBalancerNamesFromService(svc)
+	if err != nil {
+		return fmt.Errorf("unable to derive LB names: %w", err)
+	}
+	exists, err := c.cloud.LoadBalancerExistsByNames(ctx, names)
+	if err != nil {
+		return fmt.Errorf("unable to check LB: %w", err)
+	}
+	if !exists {
+		return nil
+	}
 	lb, err := cloud.NewLoadBalancer(svc, c.opts.LBTags)
 	if err != nil {
 		return fmt.Errorf("unable to build LB: %w", err)
 	}
-	exists, err := c.cloud.LoadBalancerExists(ctx, lb)
+	exists, err = c.cloud.LoadBalancerExistsForCleanup(ctx, lb)
 	switch {
 	case errors.Is(err, cloud.ErrBelongsToSomeoneElse):
 		return nil

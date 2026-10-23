@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"regexp"
 	"slices"
@@ -68,6 +69,9 @@ var (
 	}
 	// ErrLoadBalancerIsNotReady is returned by CreateLoadBalancer/UpdateLoadBalancer when the LB is not ready yet.
 	ErrLoadBalancerIsNotReady = controllerapi.NewRetryError("load balancer is not ready", 30*time.Second)
+
+	// ErrNonTCP is returned by NewLoadBalancer for a Service declaring a non-TCP port.
+	ErrNonTCP = errors.New("only TCP load balancers are supported")
 
 	ErrBelongsToSomeoneElse = errors.New("found a LBU with the same name belonging to")
 
@@ -174,6 +178,94 @@ type LoadBalancer struct {
 
 var reName = regexp.MustCompile("^[a-zA-Z0-9-]+$")
 
+const maxLoadBalancerInstances = 3
+
+type loadBalancerNameConfig struct {
+	Names     []string `annotation:"osc-load-balancer-name"`
+	Instances int      `annotation:"osc-load-balancer-instances"`
+}
+
+// LoadBalancerNamesFromService returns the LBU names derived from Service
+// identity and name-related annotations.
+func LoadBalancerNamesFromService(svc *corev1.Service) ([]string, error) {
+	config, err := loadBalancerNameConfigFromAnnotations(svc.Annotations)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode load balancer name annotations: %w", err)
+	}
+	return deriveLoadBalancerNames(svc, config.Names, config.Instances)
+}
+
+func loadBalancerNameConfigFromAnnotations(annotations map[string]string) (loadBalancerNameConfig, error) {
+	config := loadBalancerNameConfig{Instances: DefaultLoadBalancerConfiguration.Instances}
+	var namesSet, instancesSet bool
+	for key, value := range annotations {
+		switch {
+		case matchAnnotationName(key, "osc-load-balancer-name"):
+			names := strings.Split(value, ",")
+			if namesSet && !slices.Equal(config.Names, names) {
+				return loadBalancerNameConfig{}, errors.New("conflicting load balancer name annotations")
+			}
+			config.Names = names
+			namesSet = true
+		case matchAnnotationName(key, "osc-load-balancer-instances"):
+			instances, err := strconv.Atoi(value)
+			if err != nil {
+				return loadBalancerNameConfig{}, fmt.Errorf("invalid load balancer instances %q: %w", value, err)
+			}
+			if instancesSet && config.Instances != instances {
+				return loadBalancerNameConfig{}, errors.New("conflicting load balancer instances annotations")
+			}
+			config.Instances = instances
+			instancesSet = true
+		}
+	}
+	return config, nil
+}
+
+func deriveLoadBalancerNames(svc *corev1.Service, configured []string, instances int) ([]string, error) {
+	if instances < 1 || instances > maxLoadBalancerInstances {
+		return nil, fmt.Errorf("load balancer instances must be between 1 and %d", maxLoadBalancerInstances)
+	}
+	names := slices.Clone(configured)
+	if len(names) > 0 && len(names) != instances {
+		return nil, fmt.Errorf("invalid name count: %d expected, %d found", instances, len(names))
+	}
+	uidName := strings.ReplaceAll(string(svc.UID), "-", "")
+	if len(names) == 0 && uidName == "" {
+		return nil, errors.New("load balancer name requires a Service UID or explicit name annotation")
+	}
+	switch {
+	case instances == 1 && len(names) == 0:
+		names = []string{uidName}
+	case len(names) == 0:
+		names = make([]string, 0, instances)
+		base := uidName
+		if len(base) > 30 {
+			base = base[:30]
+		}
+		base += "-"
+		for i := range instances {
+			names = append(names, base+string([]byte{'a' + byte(i)}))
+		}
+	}
+	for i, name := range names {
+		if !reName.MatchString(name) {
+			return nil, fmt.Errorf("invalid name %q, only letters, numbers and - are allowed", name)
+		}
+		if lo.Count(names, name) > 1 {
+			return nil, fmt.Errorf("duplicate name %q", name)
+		}
+		if len(name) > 32 {
+			name = name[:32]
+			if slices.Contains(names, name) {
+				return nil, fmt.Errorf("duplicate name %q after truncation to 32 chars", name)
+			}
+			names[i] = name
+		}
+	}
+	return names, nil
+}
+
 // NewLoadBalancer creates a new LoadBalancer instance from a Kubernetes Service.
 func NewLoadBalancer(svc *corev1.Service, addTags map[string]string) (*LoadBalancer, error) {
 	if svc.Spec.SessionAffinity != corev1.ServiceAffinityNone {
@@ -191,8 +283,14 @@ func NewLoadBalancer(svc *corev1.Service, addTags map[string]string) (*LoadBalan
 	}
 	err := lb.decodeAnnotations(svc.Annotations)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to decode annotations: %w", err)
 	}
+	nameConfig, err := loadBalancerNameConfigFromAnnotations(svc.Annotations)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode load balancer name annotations: %w", err)
+	}
+	lb.Name = slices.Clone(nameConfig.Names)
+	lb.Instances = nameConfig.Instances
 	// set defaults
 	err = mergo.Merge(lb, DefaultLoadBalancerConfiguration)
 	if err != nil {
@@ -204,42 +302,9 @@ func NewLoadBalancer(svc *corev1.Service, addTags map[string]string) (*LoadBalan
 		return nil, errors.New("instances cannot be changed on a configured service")
 	}
 
-	switch {
-	case lb.Instances == 1 && len(lb.Name) == 0:
-		// autogenerated name, single instance
-		lb.Name = []string{strings.ReplaceAll(string(svc.UID), "-", "")}
-	case len(lb.Name) == 0:
-		// autogenerated name, multiple instances (add -a/b/c)
-		lb.Name = make([]string, 0, lb.Instances)
-		base := strings.ReplaceAll(string(svc.UID), "-", "")
-		// UIDs are UUIDs, therefore more than 30 chars without '-', but we never know - things might change
-		if len(base) > 30 {
-			base = base[:30]
-		}
-		base += "-"
-		for i := range lb.Instances {
-			lb.Name = append(lb.Name, base+string([]byte{'a' + byte(i)}))
-		}
-	case len(lb.Name) < lb.Instances:
-		// configured names, not enough names
-		return nil, fmt.Errorf("missing name: %d expected, %d found", lb.Instances, len(lb.Name))
-	default:
-		// configured names, validate format & duplicates
-		for i, name := range lb.Name {
-			if !reName.MatchString(name) {
-				return nil, fmt.Errorf("invalid name %q, only letters, numbers and - are allowed", name)
-			}
-			if lo.Count(lb.Name, name) > 1 {
-				return nil, fmt.Errorf("duplicate name %q", name)
-			}
-			if len(name) > 32 {
-				name = name[:32]
-				if slices.Contains(lb.Name, name) {
-					return nil, fmt.Errorf("duplicate name %q after truncation to 32 chars", name)
-				}
-				lb.Name[i] = name
-			}
-		}
+	lb.Name, err = deriveLoadBalancerNames(svc, lb.Name, lb.Instances)
+	if err != nil {
+		return nil, fmt.Errorf("unable to derive load balancer names: %w", err)
 	}
 	if lb.Instances > 1 {
 		switch len(lb.SubRegions) {
@@ -269,7 +334,7 @@ func NewLoadBalancer(svc *corev1.Service, addTags map[string]string) (*LoadBalan
 
 	for _, port := range svc.Spec.Ports {
 		if port.Protocol != corev1.ProtocolTCP {
-			return nil, errors.New("only TCP load balancers are supported")
+			return nil, ErrNonTCP
 		}
 		if port.NodePort == 0 {
 			continue
@@ -282,7 +347,7 @@ func NewLoadBalancer(svc *corev1.Service, addTags map[string]string) (*LoadBalan
 
 	lb.AllowFrom, err = servicehelpers.GetLoadBalancerSourceRanges(svc)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to get load balancer source ranges: %w", err)
 	}
 
 	path, port := servicehelpers.GetServiceHealthCheckPathPort(svc)
@@ -316,6 +381,7 @@ var mappings = map[string]string{
 
 // decodeAnnotations decodes annotations to the LoadBalancer struct.
 func (l *LoadBalancer) decodeAnnotations(annotations map[string]string) error {
+	annotations = maps.Clone(annotations)
 	// compatibility mappings
 	for k, nk := range mappings {
 		if v, ok := annotations[k]; ok {
@@ -432,26 +498,69 @@ func (c *Cloud) LoadBalancerExists(ctx context.Context, l *LoadBalancer) (bool, 
 	lbus, err := c.getLBUs(ctx, l)
 	switch {
 	case err != nil:
-		return false, err
+		return false, fmt.Errorf("unable to check load balancer %q existence: %w", l.Name, err)
 	case len(lbus) == 0:
 		return false, nil
 	}
-	if !c.sameCluster(lbus[0].Tags) {
-		return false, fmt.Errorf("%w another cluster", ErrBelongsToSomeoneElse)
-	}
-	svcName := tags.GetServiceName(lbus[0].Tags)
-	if svcName != "" && svcName != l.ServiceName {
-		return false, fmt.Errorf("%w another service", ErrBelongsToSomeoneElse)
+	if err := c.checkLoadBalancerOwnership(lbus, l); err != nil {
+		return false, fmt.Errorf("load balancer %q does not belong to this cluster: %w", l.Name, err)
 	}
 	return len(lbus) == l.Instances, nil
 }
 
+// LoadBalancerExistsByNames reports whether any LBU matches the supplied names.
+func (c *Cloud) LoadBalancerExistsByNames(ctx context.Context, names []string) (bool, error) {
+	lbus, err := c.getLBUsByNames(ctx, names)
+	if err != nil {
+		return false, fmt.Errorf("unable to check load balancers %q existence: %w", names, err)
+	}
+	return len(lbus) > 0, nil
+}
+
+// LoadBalancerExistsForCleanup checks ownership and reports partial sets as present.
+func (c *Cloud) LoadBalancerExistsForCleanup(ctx context.Context, l *LoadBalancer) (bool, error) {
+	lbus, err := c.getLBUs(ctx, l)
+	switch {
+	case err != nil:
+		return false, fmt.Errorf("unable to check load balancer %q for cleanup: %w", l.Name, err)
+	case len(lbus) == 0:
+		return false, nil
+	}
+	if err := c.checkLoadBalancerOwnership(lbus, l); err != nil {
+		return false, fmt.Errorf("load balancer %q is not owned by this cluster: %w", l.Name, err)
+	}
+	return true, nil
+}
+
+func (c *Cloud) checkLoadBalancerOwnership(lbus []osc.LoadBalancer, l *LoadBalancer) error {
+	for _, lbu := range lbus {
+		if !c.sameCluster(lbu.Tags) {
+			return fmt.Errorf("%w: load balancer %q belongs to another cluster", ErrBelongsToSomeoneElse, lbu.LoadBalancerName)
+		}
+		svcName := tags.GetServiceName(lbu.Tags)
+		if svcName != "" && svcName != l.ServiceName {
+			return fmt.Errorf("%w: load balancer %q belongs to another service", ErrBelongsToSomeoneElse, lbu.LoadBalancerName)
+		}
+	}
+	return nil
+}
+
 func (c *Cloud) getLBUs(ctx context.Context, l *LoadBalancer) ([]osc.LoadBalancer, error) {
+	return c.getLBUsByNames(ctx, l.Name)
+}
+
+func (c *Cloud) getLBUsByNames(ctx context.Context, names []string) ([]osc.LoadBalancer, error) {
+	if len(names) == 0 {
+		return nil, errors.New("load balancer names cannot be empty")
+	}
 	res, err := c.api.OAPI().ReadLoadBalancers(ctx, osc.ReadLoadBalancersRequest{
-		Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &l.Name},
+		Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to read load balancers %q: %w", names, err)
+	}
+	if res == nil || res.LoadBalancers == nil {
+		return nil, fmt.Errorf("read load balancers %q returned no result", names)
 	}
 	return *res.LoadBalancers, nil
 }
@@ -508,7 +617,7 @@ func (c *Cloud) CreateLoadBalancer(ctx context.Context, l *LoadBalancer, backend
 		case l.PublicIPPool != "":
 			ip, err := sdk.AllocateIPFromPool(ctx, l.PublicIPPool, c.api.OAPI())
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("unable to allocate IP from pool %q: %w", l.PublicIPPool, err)
 			}
 			createRequest.PublicIp = &ip.PublicIp
 		}
@@ -1364,6 +1473,9 @@ func (c *Cloud) DeleteLoadBalancer(ctx context.Context, l *LoadBalancer) error {
 	existings, err := c.getLBUs(ctx, l)
 	if err != nil {
 		return fmt.Errorf("check LB: %w", err)
+	}
+	if err := c.checkLoadBalancerOwnership(existings, l); err != nil {
+		return fmt.Errorf("load balancer %q is not owned by this cluster: %w", l.Name, err)
 	}
 	for _, existing := range existings {
 		// remove all backend VMs

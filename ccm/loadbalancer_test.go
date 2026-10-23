@@ -15,13 +15,85 @@ import (
 	"github.com/outscale/cloud-provider-osc/ccm"
 	"github.com/outscale/cloud-provider-osc/ccm/cloud"
 	"github.com/outscale/goutils/k8s/tags"
+	"github.com/outscale/goutils/sdk/mocks_osc"
 	"github.com/outscale/osc-sdk-go/v3/pkg/osc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
+
+func TestGetLoadBalancerDerivesNameForNonTCPService(t *testing.T) {
+	uid := "01234567-89ab-cdef-0123-456789abcdef"
+	svc := testSvc()
+	delete(svc.Annotations, "service.beta.kubernetes.io/osc-load-balancer-name")
+	svc.UID = types.UID(uid)
+	svc.Spec.Ports[0].Protocol = corev1.ProtocolUDP
+	c, oa, _ := newAPI(t, self, []string{"foo"})
+	oa.EXPECT().
+		ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+			Filters: &osc.FiltersLoadBalancer{
+				LoadBalancerNames: &[]string{strings.ReplaceAll(uid, "-", "")},
+			},
+		})).
+		Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &[]osc.LoadBalancer{}}, nil)
+	p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+	_, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+	require.NoError(t, err)
+	assert.False(t, exists)
+}
+
+func TestLoadBalancerExistsByNames(t *testing.T) {
+	t.Run("Empty names fail without calling the API", func(t *testing.T) {
+		c, _, _ := newAPI(t, self, []string{"foo"})
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), nil)
+		require.Error(t, err)
+		assert.False(t, exists)
+	})
+	t.Run("Zero results are absent", func(t *testing.T) {
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		names := []string{"lb-a", "lb-b"}
+		expectNoLoadbalancersByNames(mock, names)
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), names)
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+	t.Run("A partial result is present", func(t *testing.T) {
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		names := []string{"lb-a", "lb-b"}
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+				Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+			})).
+			Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &[]osc.LoadBalancer{{LoadBalancerName: "lb-a"}}}, nil)
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), names)
+		require.NoError(t, err)
+		assert.True(t, exists)
+	})
+	t.Run("API errors are returned", func(t *testing.T) {
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().ReadLoadBalancers(gomock.Any(), gomock.Any()).Return(nil, assert.AnError)
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), []string{"lb-a"})
+		require.ErrorIs(t, err, assert.AnError)
+		assert.False(t, exists)
+	})
+	t.Run("A nil response is returned as an error", func(t *testing.T) {
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().ReadLoadBalancers(gomock.Any(), gomock.Any()).Return(nil, nil)
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), []string{"lb-a"})
+		require.Error(t, err)
+		assert.False(t, exists)
+	})
+	t.Run("A nil load balancer list is returned as an error", func(t *testing.T) {
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().ReadLoadBalancers(gomock.Any(), gomock.Any()).Return(&osc.ReadLoadBalancersResponse{}, nil)
+		exists, err := c.LoadBalancerExistsByNames(t.Context(), []string{"lb-a"})
+		require.Error(t, err)
+		assert.False(t, exists)
+	})
+}
 
 func testSvc() *corev1.Service {
 	return &corev1.Service{
@@ -46,10 +118,118 @@ func testSvc() *corev1.Service {
 	}
 }
 
+// newNonTCPProvider returns a provider and a Service with a UDP port.
+// With no setup callback, any cloud API call fails the test.
+func newNonTCPProvider(t *testing.T, setup ...func(*mocks_osc.MockClient)) (*ccm.Provider, *corev1.Service) {
+	svc := testSvc()
+	svc.Spec.Ports[0].Protocol = corev1.ProtocolUDP
+	c, oa, _ := newAPI(t, self, []string{"foo"})
+	for _, s := range setup {
+		s(oa)
+	}
+	p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+	return p, svc
+}
+
 func TestGetLoadBalancer(t *testing.T) {
+	t.Run("A Service without a UID or explicit name fails without calling the API", func(t *testing.T) {
+		svc := testSvc()
+		delete(svc.Annotations, "service.beta.kubernetes.io/osc-load-balancer-name")
+		c, _, _ := newAPI(t, self, []string{"foo"})
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		_, _, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+
+		require.Error(t, err)
+	})
+	t.Run("A non-TCP Service with a matching load balancer returns a build error", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t, func(m *mocks_osc.MockClient) { expectLoadbalancerExistsAndOwned(m) })
+		_, _, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cloud.ErrNonTCP)
+	})
+	t.Run("A non-TCP Service without a matching load balancer is reported as non-existent", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t, expectNoLoadbalancer)
+		status, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Nil(t, status)
+	})
+	t.Run("An absent non-TCP Service with an invalid source range is reported as non-existent", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t, expectNoLoadbalancer)
+		svc.Spec.LoadBalancerSourceRanges = []string{"invalid"}
+
+		status, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Nil(t, status)
+		assert.Equal(t, corev1.ProtocolUDP, svc.Spec.Ports[0].Protocol)
+	})
+	t.Run("An absent Service with invalid session affinity is reported as non-existent", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.SessionAffinity = corev1.ServiceAffinityClientIP
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectNoLoadbalancer(mock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+		status, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+		require.NoError(t, err)
+		assert.False(t, exists)
+		assert.Nil(t, status)
+	})
+	t.Run("A present Service with an invalid source range returns a build error", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.LoadBalancerSourceRanges = []string{"invalid"}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		_, _, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unable to build LB")
+	})
+	t.Run("A name lookup API error is returned", func(t *testing.T) {
+		svc := testSvc()
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Any()).
+			Return(nil, assert.AnError)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		_, _, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+
+		require.ErrorIs(t, err, assert.AnError)
+	})
+	t.Run("A partial multi-instance load balancer is reported as existing", func(t *testing.T) {
+		svc := testSvc()
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-name"] = "lb-foo,lb-bar"
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-instances"] = "2"
+		names := []string{"lb-foo", "lb-bar"}
+		partial := []osc.LoadBalancer{{LoadBalancerName: "lb-foo", DnsName: "foo.example.com"}}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+				Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+			})).
+			Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &partial}, nil)
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+				Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+			})).
+			Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &partial}, nil)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		status, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
+
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "foo.example.com", status.Ingress[0].Hostname)
+	})
 	t.Run("If the ingress is configured, it is returned", func(t *testing.T) {
 		svc := testSvc()
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -64,6 +244,7 @@ func TestGetLoadBalancer(t *testing.T) {
 		svc := testSvc()
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-address"] = "ip"
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -78,6 +259,7 @@ func TestGetLoadBalancer(t *testing.T) {
 		svc := testSvc()
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-address"] = "hostname"
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -92,6 +274,7 @@ func TestGetLoadBalancer(t *testing.T) {
 		svc := testSvc()
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-address"] = "both"
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -105,6 +288,7 @@ func TestGetLoadBalancer(t *testing.T) {
 	t.Run("If no ingress is configured, no ingresses are returned", func(t *testing.T) {
 		svc := testSvc()
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) { desc.DnsName = "" })
 		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
 		status, exists, err := p.GetLoadBalancer(t.Context(), "foo", svc)
@@ -126,6 +310,7 @@ func TestGetLoadBalancer(t *testing.T) {
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-address"] = "hostname"
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-ipmode"] = "Proxy"
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -141,6 +326,7 @@ func TestGetLoadBalancer(t *testing.T) {
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-address"] = "both"
 		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-ingress-ipmode"] = "VIP"
 		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
 		expectReadLoadBalancer(mock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "bar.example.com"
 			desc.PublicIp = new("198.51.100.42")
@@ -162,6 +348,15 @@ func TestGetLoadBalancerName(t *testing.T) {
 }
 
 func TestEnsureLoadBalancer_Create(t *testing.T) {
+	t.Run("A Service with a non-TCP port is refused, without calling the API", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.Ports[0].Protocol = corev1.ProtocolUDP
+		c, _, _ := newAPI(t, self, []string{"foo"}) // no expectation: any API call fails the test
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+		_, err := p.EnsureLoadBalancer(t.Context(), "foo", svc, []*corev1.Node{&vmNode})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cloud.ErrNonTCP)
+	})
 	t.Run("Cannot create a load-balancer if a LBU with the same name already exists but from another cluster", func(t *testing.T) {
 		svc := testSvc()
 		c, oapimock, _ := newAPI(t, self, []string{"foo"})
@@ -1047,6 +1242,12 @@ func TestEnsureLoadBalancer_Update(t *testing.T) {
 }
 
 func TestUpdateLoadBalancer(t *testing.T) {
+	t.Run("A non-TCP Service returns a build error without calling the API", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t)
+		err := p.UpdateLoadBalancer(t.Context(), "foo", svc, []*corev1.Node{&vmNode})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cloud.ErrNonTCP)
+	})
 	t.Run("Listeners are updated", func(t *testing.T) {
 		svc := testSvc()
 		svc.Spec.Ports[0].Port = 8080
@@ -1196,13 +1397,170 @@ func TestUpdateLoadBalancer(t *testing.T) {
 }
 
 func TestEnsureLoadBalancerDeleted(t *testing.T) {
+	t.Run("A non-TCP Service with a matching load balancer returns a build error", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.Ports[0].Protocol = corev1.ProtocolUDP
+		c, oapimock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(oapimock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cloud.ErrNonTCP)
+	})
+	t.Run("A non-TCP Service without a matching load balancer needs no deletion", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t, expectNoLoadbalancer)
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+		require.NoError(t, err)
+	})
+	t.Run("An absent non-TCP Service with an invalid source range needs no deletion", func(t *testing.T) {
+		p, svc := newNonTCPProvider(t, expectNoLoadbalancer)
+		svc.Spec.LoadBalancerSourceRanges = []string{"invalid"}
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.NoError(t, err)
+		assert.Equal(t, corev1.ProtocolUDP, svc.Spec.Ports[0].Protocol)
+	})
+	t.Run("An absent Service with invalid session affinity needs no deletion", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.SessionAffinity = corev1.ServiceAffinityClientIP
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectNoLoadbalancer(mock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+		require.NoError(t, err)
+	})
+	t.Run("An absent Service with a stale instances annotation needs no deletion", func(t *testing.T) {
+		svc := testSvc()
+		svc.UID = types.UID("5dbb147b-3878-4d10-bf2d-96b2b463b8eb")
+		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{Hostname: "x"}}
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-instances"] = "2"
+		delete(svc.Annotations, "service.beta.kubernetes.io/osc-load-balancer-name")
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectNoLoadbalancersByNames(mock, []string{"5dbb147b38784d10bf2d96b2b463b8-a", "5dbb147b38784d10bf2d96b2b463b8-b"})
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+		require.NoError(t, err)
+	})
+	t.Run("A present Service with an invalid source range returns a build error", func(t *testing.T) {
+		svc := testSvc()
+		svc.Spec.LoadBalancerSourceRanges = []string{"invalid"}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndOwned(mock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unable to build LB")
+	})
+	t.Run("A name lookup API error is returned", func(t *testing.T) {
+		svc := testSvc()
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Any()).
+			Return(nil, assert.AnError)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.ErrorIs(t, err, assert.AnError)
+	})
+	t.Run("A partial multi-instance load balancer is deleted", func(t *testing.T) {
+		svc := testSvc()
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-name"] = "lb-foo,lb-bar"
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-instances"] = "2"
+		names := []string{"lb-foo", "lb-bar"}
+		ownedTags := []osc.ResourceTag{
+			{Key: tags.ClusterIDKey("foo")},
+			{Key: tags.ServiceName, Value: svcName},
+		}
+		partial := []osc.LoadBalancer{{LoadBalancerName: "lb-foo", Tags: ownedTags}}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		for range 3 {
+			mock.EXPECT().
+				ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+					Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+				})).
+				Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &partial}, nil)
+		}
+		expectDeleteLoadBalancer(mock)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.NoError(t, err)
+	})
+	t.Run("A partial set with a foreign second load balancer is not mutated", func(t *testing.T) {
+		svc := testSvc()
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-name"] = "lb-foo,lb-bar"
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-instances"] = "2"
+		names := []string{"lb-foo", "lb-bar"}
+		ownedTags := []osc.ResourceTag{{Key: tags.ClusterIDKey("foo")}, {Key: tags.ServiceName, Value: svcName}}
+		foreignTags := []osc.ResourceTag{{Key: tags.ClusterIDKey("foo")}, {Key: tags.ServiceName, Value: "other-service"}}
+		mixed := []osc.LoadBalancer{
+			{LoadBalancerName: "lb-foo", Tags: ownedTags},
+			{LoadBalancerName: "lb-bar", Tags: foreignTags},
+		}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		for range 2 {
+			mock.EXPECT().
+				ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+					Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+				})).
+				Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &mixed}, nil)
+		}
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.NoError(t, err)
+	})
+	t.Run("A foreign load balancer returned by the delete reread is not mutated", func(t *testing.T) {
+		svc := testSvc()
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-name"] = "lb-foo,lb-bar"
+		svc.Annotations["service.beta.kubernetes.io/osc-load-balancer-instances"] = "2"
+		names := []string{"lb-foo", "lb-bar"}
+		ownedTags := []osc.ResourceTag{{Key: tags.ClusterIDKey("foo")}, {Key: tags.ServiceName, Value: svcName}}
+		owned := []osc.LoadBalancer{
+			{LoadBalancerName: "lb-foo", Tags: ownedTags},
+			{LoadBalancerName: "lb-bar", Tags: ownedTags},
+		}
+		mixed := []osc.LoadBalancer{
+			{LoadBalancerName: "lb-foo", Tags: ownedTags},
+			{LoadBalancerName: "lb-bar", Tags: []osc.ResourceTag{{Key: tags.ClusterIDKey("bar")}, {Key: tags.ServiceName, Value: svcName}}},
+		}
+		c, mock, _ := newAPI(t, self, []string{"foo"})
+		for range 2 {
+			mock.EXPECT().
+				ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+					Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+				})).
+				Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &owned}, nil)
+		}
+		mock.EXPECT().
+			ReadLoadBalancers(gomock.Any(), gomock.Eq(osc.ReadLoadBalancersRequest{
+				Filters: &osc.FiltersLoadBalancer{LoadBalancerNames: &names},
+			})).
+			Return(&osc.ReadLoadBalancersResponse{LoadBalancers: &mixed}, nil)
+		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
+
+		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
+
+		require.ErrorIs(t, err, cloud.ErrBelongsToSomeoneElse)
+	})
 	t.Run("If the load-balancer exists, delete it", func(t *testing.T) {
 		svc := testSvc()
 		c, oapimock, _ := newAPI(t, self, []string{"foo"})
 		expectLoadbalancerExistsAndOwned(oapimock)
+		expectLoadbalancerExistsAndOwned(oapimock)
 		expectReadLoadBalancer(oapimock, func(desc *osc.LoadBalancer) {
 			desc.DnsName = "foo.example.com"
 			desc.BackendVmIds = []string{"i-foo"}
+			desc.Tags = []osc.ResourceTag{
+				{Key: tags.ClusterIDKey("foo")},
+				{Key: tags.ServiceName, Value: svcName},
+			}
 		})
 		expectDeregisterInstances(oapimock, "i-foo")
 		expectCreateTag(oapimock, "sg-foo", osc.ResourceTag{Key: cloud.SGToDeleteTagKey})
@@ -1222,6 +1580,7 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
 	t.Run("If the load-balancer belongs to someone else, do nothing", func(t *testing.T) {
 		svc := testSvc()
 		c, oapimock, _ := newAPI(t, self, []string{"foo"})
+		expectLoadbalancerExistsAndNotOwned(oapimock)
 		expectLoadbalancerExistsAndNotOwned(oapimock)
 		p := ccm.NewProviderWith(c, staticDNSResolver{}, ccm.Options{}, &sync.WaitGroup{})
 		err := p.EnsureLoadBalancerDeleted(t.Context(), "foo", svc)
